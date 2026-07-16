@@ -1,0 +1,57 @@
+[project]
+name = "ai-orchestrator"
+version = "0.1.0"
+description = "AI Orchestration System — 비개발자가 기획안과 자연어로 서비스를 개발하는 확장형 오케스트레이션 시스템"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "pydantic[email]>=2.7",
+    "pydantic-settings>=2.3",
+    "structlog>=24.1",
+    "httpx>=0.27",
+    "argon2-cffi>=23.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "aiosqlite>=0.20",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: 외부 자원(Docker/PostgreSQL 등)이 필요한 테스트 (기본 실행에서 제외 가능)",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["asyncpg.*"]
+ignore_missing_imports = true
