@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://orchestrator:orchestrator@localhost:5432/orchestrator"
     db_echo: bool = False
 
+    # Agent 실행 모드: "mock"(결정론적) | "live"(Phase 9에서 Codex/ClaudeCode Adapter 연동)
+    agent_mode: str = "mock"
+
     session_cookie_name: str = "orch_session"
     session_ttl_hours: int = 168  # 7일
     session_cookie_secure: bool = False  # 운영(HTTPS)에서는 true

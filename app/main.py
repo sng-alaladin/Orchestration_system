@@ -6,8 +6,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 
+from app.api.approvals import router as approvals_router
 from app.api.auth import router as auth_router
+from app.api.documents import router as documents_router
 from app.api.health import router as health_router
+from app.api.projects import router as projects_router
+from app.api.requirements import router as requirements_router
 from app.core.bootstrap import seed_admin_user
 from app.core.config import Settings, get_settings
 from app.db.session import create_engine_and_factory
@@ -54,6 +58,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(health_router)
     app.include_router(auth_router)
+    app.include_router(projects_router)
+    app.include_router(documents_router)
+    app.include_router(requirements_router)
+    app.include_router(approvals_router)
     return app
 
 
