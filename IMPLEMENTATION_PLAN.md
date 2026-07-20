@@ -229,7 +229,7 @@ WAITING_EXPANSION_APPROVAL로 모델링된다.)
 | MCP_CONNECTION_FAILED | MCP_RETRY_EXHAUSTED | WAITING_EXPERT_CONFIRMATION | 상담 패키지 생성 |
 | AGENT_VALIDATION_FAILED | CORRECTION_SUCCEEDED | 직전 상태 (체크포인트) | 보정 재요청(최대 2회) 내 성공. 원본 출력은 Audit Log 저장 |
 | AGENT_VALIDATION_FAILED | CORRECTION_EXHAUSTED | FAILED | FAILED 복귀 경로를 따름 |
-| AUTO_BLOCKED_BY_POLICY | ALTERNATIVE_ACCEPTED | REQUIREMENT_DRAFTING | 차단 요소 제외한 축소 요구사항으로 재작성 |
+| AUTO_BLOCKED_BY_POLICY | ALTERNATIVE_ACCEPTED | DOCUMENT_ANALYZING | 차단 요소를 제외하도록 수정된 기획으로 재분석 — **재분류 게이트 재통과 필수**(차단 요소가 남아 있으면 다시 차단됨) |
 | AUTO_BLOCKED_BY_POLICY | BLOCK_ACKNOWLEDGED_STOP | CANCELLED | 사유·대안은 사용자 언어로 설명(우회 불가) |
 | CANCELLED | (터미널) | — | 재시작은 신규 요청으로만 |
 

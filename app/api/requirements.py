@@ -15,6 +15,7 @@ from app.db.models.project_requirement import ProjectRequirement
 from app.db.models.requirement_question import RequirementQuestion
 from app.db.models.user import User
 from app.db.session import get_db
+from app.orchestrator.state_machine import StateMachineError
 from app.product.workflow import WorkflowStateError, build_workflow
 
 router = APIRouter(prefix="/api/projects/{project_id}", tags=["requirements"])
@@ -103,7 +104,7 @@ async def answer_question(
     workflow = build_workflow(db, settings)
     try:
         await workflow.answer_question(project, question_key, payload.answer, user)
-    except WorkflowStateError as exc:
+    except (WorkflowStateError, StateMachineError) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     await db.commit()
     return {"status": project.status, "status_reason": project.status_reason or ""}

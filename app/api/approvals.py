@@ -16,6 +16,7 @@ from app.db.models.project import Project
 from app.db.models.user import User
 from app.db.models.user_approval import UserApproval
 from app.db.session import get_db
+from app.orchestrator.state_machine import StateMachineError
 from app.product.workflow import WorkflowStateError, build_workflow
 
 router = APIRouter(prefix="/api/projects/{project_id}/approvals", tags=["approvals"])
@@ -53,7 +54,7 @@ async def decide(
                 status.HTTP_400_BAD_REQUEST,
                 f"{payload.approval_type} 승인은 아직 지원되지 않습니다.",
             )
-    except WorkflowStateError as exc:
+    except (WorkflowStateError, StateMachineError) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     await db.commit()
     return {"status": project.status, "status_reason": project.status_reason or ""}

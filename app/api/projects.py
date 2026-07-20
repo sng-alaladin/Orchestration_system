@@ -3,7 +3,7 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,7 +16,12 @@ from app.db.models.project import Project
 from app.db.models.project_classification import ProjectClassification
 from app.db.models.user import User
 from app.db.session import get_db
-from app.product.workflow import build_workflow
+from app.orchestrator.state_machine import StateMachineError
+from app.product.workflow import (
+    EXPERT_CONSULTATION_NOT_READY,
+    WorkflowStateError,
+    build_workflow,
+)
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -136,10 +141,25 @@ async def update_idea(
 @router.post("/{project_id}/analyze")
 async def analyze_project(
     project: Annotated[Project, Depends(get_owned_project)],
+    user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_app_settings)],
 ) -> ProjectResponse:
     workflow = build_workflow(db, settings)
-    await workflow.run_analysis(project)
+    try:
+        await workflow.run_analysis(project, actor_id=user.id)
+    except (WorkflowStateError, StateMachineError) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     await db.commit()
     return ProjectResponse.from_model(project)
+
+
+@router.post("/{project_id}/consultation")
+async def request_consultation(
+    project: Annotated[Project, Depends(get_owned_project)],
+) -> None:
+    """전문가 상담 패키지 생성 — Phase 7(세션 4)에서 구현 예정.
+
+    조용히 실패하지 않도록 명시적 501(Not Implemented)을 반환한다.
+    """
+    raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, EXPERT_CONSULTATION_NOT_READY)

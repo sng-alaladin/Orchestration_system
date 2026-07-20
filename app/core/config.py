@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     # Agent 실행 모드: "mock"(결정론적) | "live"(Phase 9에서 Codex/ClaudeCode Adapter 연동)
     agent_mode: str = "mock"
 
+    # 상태 머신: FAILED → RETRY_SCHEDULED 재시도 한도
+    max_retry_attempts: int = 3
+    # Capability Registry 초기 정의 파일
+    capabilities_config: str = "configs/capabilities.yaml"
+    # 대기 상태 타임아웃 정의 파일
+    state_timeouts_config: str = "configs/state-timeouts.yaml"
+
     session_cookie_name: str = "orch_session"
     session_ttl_hours: int = 168  # 7일
     session_cookie_secure: bool = False  # 운영(HTTPS)에서는 true

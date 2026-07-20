@@ -1,0 +1,60 @@
+# Capability Registry 초기 정의 (spec 04 §18)
+# 기동 시 DB(capabilities/capability_providers)로 동기화된다.
+# priority: 낮을수록 우선 (기존 Agent 재사용 > MCP > LIBRARY)
+#
+# 주의: email-send 등 외부 발송 역량은 의도적으로 미등록 상태다.
+# 해당 역량이 필요한 기획안은 Capability Gap → EXPANSION_PROPOSING으로 빠지며,
+# 확장 Proposal·Policy Engine 판정은 세션 4(Phase 6~7)에서 구현된다.
+
+capabilities:
+  requirement-analysis:
+    description: 기획안을 구조화 요구사항으로 변환
+    providers:
+      - {name: requirement-agent, type: AGENT, priority: 10}
+
+  source-code-edit:
+    description: 소스 코드 작성·수정
+    providers:
+      - {name: coder-agent, type: AGENT, priority: 10}
+
+  code-review:
+    description: 코드 리뷰
+    providers:
+      - {name: reviewer-agent, type: AGENT, priority: 10}
+
+  excel-read:
+    description: 엑셀 파일 읽기·구조 분석
+    providers:
+      - {name: coder-agent, type: AGENT, priority: 20}
+      - {name: openpyxl, type: LIBRARY, priority: 30}
+
+  document-generate:
+    description: 보고서·문서 생성 (Word/PDF 등)
+    providers:
+      - {name: coder-agent, type: AGENT, priority: 20}
+
+  web-ui:
+    description: 웹 화면 구현
+    providers:
+      - {name: coder-agent, type: AGENT, priority: 20}
+
+  data-analyze:
+    description: 데이터 분석·집계
+    providers:
+      - {name: coder-agent, type: AGENT, priority: 20}
+      - {name: pandas, type: LIBRARY, priority: 30}
+
+  file-storage:
+    description: 파일 저장·보관
+    providers:
+      - {name: coder-agent, type: AGENT, priority: 20}
+
+  web-scrape:
+    description: 웹 페이지 수집 (위험 경계 — 축소 범위 승인 대상)
+    providers:
+      - {name: coder-agent, type: AGENT, priority: 40}
+
+  general-automation:
+    description: 일반 업무 자동화
+    providers:
+      - {name: coder-agent, type: AGENT, priority: 20}

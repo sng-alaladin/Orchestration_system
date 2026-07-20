@@ -1,16 +1,19 @@
-"""Product Definition Workflow — 결정론적 오케스트레이션 (Phase 2 Mock 수준).
+"""Product Definition Workflow — 결정론적 오케스트레이션.
 
-상태 이름과 전환은 IMPLEMENTATION_PLAN.md §6.1/6.3을 따른다.
-- 상태 변경은 이 모듈의 코드로만 수행한다 (LLM이 상태를 바꾸지 않는다).
-- 선언적 전환 테이블·체크포인트·Audit Log는 Phase 4(세션 3)에서 정식 구현하며,
-  여기서는 허용 전이 집합으로 불법 전이만 차단한다.
+상태 변경은 전부 Orchestrator 상태 머신(`app/orchestrator/`)의 fire()로 수행한다.
+전환의 단일 진실 원천은 `app/orchestrator/transitions.py` 이며,
+이 모듈은 어떤 이벤트를 언제 발생시킬지(비즈니스 순서)만 결정한다.
+LLM(Agent)은 구조화 결과만 반환하고 상태를 변경하지 않는다.
 """
 
 import uuid
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.capabilities.gap_analyzer import GapAnalyzer
+from app.capabilities.registry import CapabilityRegistry
 from app.core.clock import utc_now
 from app.core.config import Settings
 from app.core.enums import (
@@ -29,11 +32,12 @@ from app.core.exceptions import AppError
 from app.db.models.project import Project
 from app.db.models.project_classification import ProjectClassification
 from app.db.models.project_document import ProjectDocument
-from app.db.models.project_requirement import ProjectRequirement
 from app.db.models.requirement_question import RequirementQuestion
 from app.db.models.user import User
 from app.db.models.user_approval import UserApproval
 from app.observability.logging import get_logger
+from app.orchestrator.product_state_machine import build_product_state_machine
+from app.orchestrator.state_machine import StateMachine
 from app.product.backlog_generator import render_backlog_markdown
 from app.product.classifier import Classifier
 from app.product.core_agent import CoreAgent, MockCoreAgent
@@ -46,37 +50,17 @@ from app.project_memory.service import ProjectMemoryService
 
 logger = get_logger(__name__)
 
-
-class IllegalTransitionError(AppError):
-    """허용되지 않은 상태 전이."""
+# 전문가 상담 패키지 서비스(Phase 7, 세션 4) 구현 전의 명시적 안내문.
+# 조용히 멈추지 않는다 — 사용자에게 무엇이 안 되고 무엇을 할 수 있는지 알린다.
+EXPERT_CONSULTATION_NOT_READY = (
+    "전문가 상담 패키지 자동 생성 기능은 아직 준비 중입니다(세션 4에서 추가 예정). "
+    "지금은 위 사유를 개발자에게 직접 전달해 확인을 받아 주세요. "
+    "확인이 끝나면 시스템 운영자가 진행을 재개할 수 있습니다."
+)
 
 
 class WorkflowStateError(AppError):
     """현재 상태에서 수행할 수 없는 요청 (사용자 언어 메시지 포함)."""
-
-
-_LEGAL_TRANSITIONS: set[tuple[str, str]] = {
-    (ProductState.IDEA_RECEIVED, ProductState.DOCUMENT_ANALYZING),
-    # AUTO_BLOCKED_BY_POLICY → ALTERNATIVE_ACCEPTED (축소 기획으로 재분석)
-    (ProductState.AUTO_BLOCKED_BY_POLICY, ProductState.DOCUMENT_ANALYZING),
-    (ProductState.DOCUMENT_ANALYZING, ProductState.CLASSIFYING),
-    (ProductState.CLASSIFYING, ProductState.REQUIREMENT_DRAFTING),
-    (ProductState.CLASSIFYING, ProductState.WAITING_APPROVAL),
-    (ProductState.CLASSIFYING, ProductState.WAITING_EXPERT_CONFIRMATION),
-    (ProductState.CLASSIFYING, ProductState.AUTO_BLOCKED_BY_POLICY),
-    (ProductState.CLASSIFYING, ProductState.CANCELLED),
-    (ProductState.WAITING_APPROVAL, ProductState.REQUIREMENT_DRAFTING),
-    (ProductState.WAITING_APPROVAL, ProductState.CANCELLED),
-    (ProductState.REQUIREMENT_DRAFTING, ProductState.WAITING_REQUIREMENT_INPUT),
-    (ProductState.REQUIREMENT_DRAFTING, ProductState.WAITING_REQUIREMENT_APPROVAL),
-    (ProductState.WAITING_REQUIREMENT_INPUT, ProductState.REQUIREMENT_DRAFTING),
-    (ProductState.WAITING_REQUIREMENT_APPROVAL, ProductState.SPECIFICATION_GENERATING),
-    (ProductState.WAITING_REQUIREMENT_APPROVAL, ProductState.REQUIREMENT_DRAFTING),
-    (ProductState.SPECIFICATION_GENERATING, ProductState.CAPABILITY_ANALYZING),
-    (ProductState.CAPABILITY_ANALYZING, ProductState.BACKLOG_GENERATING),
-    # BOOTSTRAPPING(신규 Repo)은 Phase 8 범위 — 현재는 바로 READY_FOR_DEVELOPMENT
-    (ProductState.BACKLOG_GENERATING, ProductState.READY_FOR_DEVELOPMENT),
-}
 
 
 def build_workflow(session: AsyncSession, settings: Settings) -> "ProductDefinitionWorkflow":
@@ -88,6 +72,7 @@ def build_workflow(session: AsyncSession, settings: Settings) -> "ProductDefinit
         )
     return ProductDefinitionWorkflow(
         session=session,
+        settings=settings,
         classifier=Classifier(),
         core_agent=MockCoreAgent(),
         requirement_agent=MockRequirementAgent(),
@@ -99,39 +84,44 @@ class ProductDefinitionWorkflow:
     def __init__(
         self,
         session: AsyncSession,
+        settings: Settings,
         classifier: Classifier,
         core_agent: CoreAgent,
         requirement_agent: RequirementAgent,
         specification_agent: SpecificationAgent,
     ) -> None:
         self._session = session
+        self._settings = settings
         self._classifier = classifier
         self._core = core_agent
         self._requirement = requirement_agent
         self._specification = specification_agent
         self._memory = ProjectMemoryService(session)
+        self._machine: StateMachine = build_product_state_machine(
+            session, max_retries=settings.max_retry_attempts
+        )
 
     # ── 1) 기획안 분석 + 적합도 분류 게이트 ─────────────────────────
 
-    async def run_analysis(self, project: Project) -> Project:
-        if project.status not in (
-            ProductState.IDEA_RECEIVED,
-            ProductState.AUTO_BLOCKED_BY_POLICY,
-        ):
+    async def run_analysis(self, project: Project, actor_id: uuid.UUID | None = None) -> Project:
+        if project.status == ProductState.IDEA_RECEIVED:
+            entry_event = "ANALYSIS_STARTED"
+        elif project.status == ProductState.AUTO_BLOCKED_BY_POLICY:
+            # §6.3: ALTERNATIVE_ACCEPTED — 수정된 기획으로 재분석 (재분류 게이트 재통과 필수)
+            entry_event = "ALTERNATIVE_ACCEPTED"
+        else:
             raise WorkflowStateError(
                 "이 프로젝트는 이미 분석이 시작되었습니다. 현재 단계에서 계속 진행해 주세요."
             )
+
+        await self._fire(project, entry_event, actor_id=actor_id)
         project_input = await self._collect_input(project)
-        if not project_input.combined_text:
-            raise WorkflowStateError(
-                "분석할 기획 내용이 없습니다. 기획안 내용을 입력하거나 문서를 올려 주세요."
-            )
-
-        self._set_status(project, ProductState.DOCUMENT_ANALYZING)
         analysis = await self._core.analyze(project_input)
+        await self._fire(project, "ANALYSIS_COMPLETED", actor_id=actor_id)
 
-        self._set_status(project, ProductState.CLASSIFYING)
         classification = self._classifier.classify(project_input.combined_text)
+        previous = await self._latest_classification(project.id)
+        carried_expert_confirmed = bool(previous and previous.expert_confirmed)
         self._session.add(
             ProjectClassification(
                 project_id=project.id,
@@ -141,37 +131,52 @@ class ProductDefinitionWorkflow:
                 prohibited_features=classification.prohibited_features,
                 risky_features=classification.risky_features,
                 user_message=classification.user_message,
+                # 전문가 확인 완료 이력은 재분류 시에도 유지한다 (무한 루프 방지)
+                expert_confirmed=carried_expert_confirmed,
             )
         )
         await self._session.flush()
 
         match classification.gate:
             case ClassificationGate.BLOCKED:
-                self._set_status(
-                    project, ProductState.AUTO_BLOCKED_BY_POLICY, classification.user_message
+                await self._fire(
+                    project, "PROHIBITED_SCOPE_DETECTED",
+                    reason=classification.user_message, actor_id=actor_id,
                 )
             case ClassificationGate.UNSUPPORTED:
-                self._set_status(project, ProductState.CANCELLED, classification.user_message)
-            case ClassificationGate.NEEDS_EXPERT:
-                # 상담 패키지 생성은 Phase 7(세션 4) 범위 — 상태와 사유만 기록한다.
-                self._set_status(
-                    project,
-                    ProductState.WAITING_EXPERT_CONFIRMATION,
-                    classification.user_message,
+                await self._fire(
+                    project, "CLASSIFIED_UNSUPPORTED",
+                    reason=classification.user_message, actor_id=actor_id,
                 )
+            case ClassificationGate.NEEDS_EXPERT:
+                if carried_expert_confirmed:
+                    # 이미 전문가 확인이 끝난 프로젝트 — 재차 대기시키지 않는다 (§6.1)
+                    await self._fire(project, "EXPERT_CONFIRMED_PROCEED", actor_id=actor_id)
+                    await self._draft_requirements(project, analysis, actor_id)
+                else:
+                    await self._fire(
+                        project, "CLASSIFIED_EXPERT_REVIEW",
+                        reason=f"{classification.user_message}\n{EXPERT_CONSULTATION_NOT_READY}",
+                        actor_id=actor_id,
+                    )
             case ClassificationGate.NEEDS_APPROVAL:
-                self._set_status(
-                    project, ProductState.WAITING_APPROVAL, classification.user_message
+                await self._fire(
+                    project, "CLASSIFIED_AI_ASSISTED",
+                    reason=classification.user_message, actor_id=actor_id,
                 )
             case ClassificationGate.PROCEED:
-                await self._draft_requirements(project, analysis)
+                await self._fire(project, "CLASSIFIED_SELF_SERVICE", actor_id=actor_id)
+                await self._draft_requirements(project, analysis, actor_id)
         return project
 
     # ── 2) 요구사항 초안 + 질문 카드 ────────────────────────────────
 
-    async def _draft_requirements(self, project: Project, analysis: CoreAnalysis) -> None:
-        if project.status != ProductState.REQUIREMENT_DRAFTING:
-            self._set_status(project, ProductState.REQUIREMENT_DRAFTING)
+    async def _draft_requirements(
+        self, project: Project, analysis: CoreAnalysis, actor_id: uuid.UUID | None
+    ) -> None:
+        assert project.status == ProductState.REQUIREMENT_DRAFTING, (
+            f"요구사항 초안은 REQUIREMENT_DRAFTING에서만 작성한다 (현재: {project.status})"
+        )
         answers = await self._collect_answers(project.id)
         requirement_set: RequirementSet = await self._requirement.refine(analysis, answers)
 
@@ -184,23 +189,23 @@ class ProductDefinitionWorkflow:
 
         open_count = await self._count_open_questions(project.id)
         if open_count > 0:
-            self._set_status(
-                project,
-                ProductState.WAITING_REQUIREMENT_INPUT,
-                f"확인이 필요한 질문 {open_count}건에 답해 주세요.",
+            await self._fire(
+                project, "DRAFT_HAS_UNKNOWNS",
+                reason=f"확인이 필요한 질문 {open_count}건에 답해 주세요.",
+                actor_id=actor_id,
             )
         else:
-            self._set_status(
-                project,
-                ProductState.WAITING_REQUIREMENT_APPROVAL,
-                "정리된 요구사항을 확인하고 승인해 주세요.",
+            await self._fire(
+                project, "DRAFT_COMPLETED",
+                reason="정리된 요구사항을 확인하고 승인해 주세요.",
+                actor_id=actor_id,
             )
 
-    async def redraft(self, project: Project) -> Project:
+    async def redraft(self, project: Project, actor_id: uuid.UUID | None = None) -> Project:
         """답변 완료 또는 수정 요청 후 요구사항을 다시 정리한다."""
         project_input = await self._collect_input(project)
         analysis = await self._core.analyze(project_input)
-        await self._draft_requirements(project, analysis)
+        await self._draft_requirements(project, analysis, actor_id)
         return project
 
     # ── 3) 질문 답변 ────────────────────────────────────────────────
@@ -233,7 +238,8 @@ class ProductDefinitionWorkflow:
         await self._session.flush()
 
         if await self._count_open_questions(project.id) == 0:
-            await self.redraft(project)
+            await self._fire(project, "USER_ANSWERED", actor_id=user.id)
+            await self.redraft(project, actor_id=user.id)
         return project
 
     # ── 4) 승인 처리 ────────────────────────────────────────────────
@@ -260,14 +266,15 @@ class ProductDefinitionWorkflow:
         await self._session.flush()
 
         if decision == ApprovalDecision.APPROVED:
-            await self._generate_specification(project)
+            await self._fire(project, "REQUIREMENTS_APPROVED", actor_id=user.id)
+            await self._generate_specification(project, actor_id=user.id)
         else:
             if comment:
                 await self._memory.feedback.add(
                     project.id, user.id, comment, category="requirement_review"
                 )
-            self._set_status(project, ProductState.REQUIREMENT_DRAFTING)
-            await self.redraft(project)
+            await self._fire(project, "CHANGES_REQUESTED", actor_id=user.id)
+            await self.redraft(project, actor_id=user.id)
         return project
 
     async def decide_reduced_scope(
@@ -301,27 +308,37 @@ class ProductDefinitionWorkflow:
                 reason=comment,
                 source=DecisionSource.USER_CONFIRMED,
             )
-            project_input = await self._collect_input(project)
-            analysis = await self._core.analyze(project_input)
-            await self._draft_requirements(project, analysis)
+            await self._fire(project, "APPROVAL_GRANTED", actor_id=user.id)
+            await self.redraft(project, actor_id=user.id)
         else:
-            self._set_status(
-                project,
-                ProductState.CANCELLED,
-                "축소 범위 제안이 거절되어 프로젝트를 중단했습니다. "
-                "기획을 수정해 새로 시작할 수 있습니다.",
+            await self._fire(
+                project, "APPROVAL_DENIED",
+                reason=(
+                    "축소 범위 제안이 거절되어 프로젝트를 중단했습니다. "
+                    "기획을 수정해 새로 시작할 수 있습니다."
+                ),
+                actor_id=user.id,
             )
         return project
 
-    # ── 5) 명세(PRD) + Backlog 생성 ────────────────────────────────
+    # ── 5) 명세(PRD) + Capability Gap + Backlog ────────────────────
 
-    async def _generate_specification(self, project: Project) -> None:
-        self._set_status(project, ProductState.SPECIFICATION_GENERATING)
+    async def _generate_specification(
+        self, project: Project, actor_id: uuid.UUID | None
+    ) -> None:
         project_input = await self._collect_input(project)
         analysis = await self._core.analyze(project_input)
         requirements = await self._memory.requirements.list_active(project.id)
-        # DB 상태를 기준으로 명세를 생성한다 (승인된 내용 그대로)
-        drafts = [_to_draft(r) for r in requirements]
+        drafts = [
+            RequirementDraft(
+                key=r.req_key,
+                description=r.description,
+                status=RequirementStatus(r.status),
+                category=RequirementCategory(r.category),
+                priority=r.priority,
+            )
+            for r in requirements
+        ]
         decisions = [
             (d.title, d.decision) for d in await self._memory.decisions.list_active(project.id)
         ]
@@ -335,44 +352,64 @@ class ProductDefinitionWorkflow:
         await self._save_generated_document(
             project, DocumentType.PRD, "PRD.md", spec.prd_markdown
         )
+        await self._fire(project, "SPEC_COMPLETED", actor_id=actor_id)
 
-        # Capability Gap 분석은 Phase 5(세션 3) 범위 — 현재는 기존 역량으로 충분하다고
-        # 판정하는 통과 스텁이며, 그 사실을 로그로 남긴다.
-        self._set_status(project, ProductState.CAPABILITY_ANALYZING)
-        logger.info(
-            "capability_analysis_stub",
-            project_id=str(project.id),
-            note="Phase 5에서 Gap Analyzer로 대체 예정 (현재: NO_GAP_FOUND 고정)",
-        )
+        # Capability Gap 분석 (Phase 5)
+        registry = CapabilityRegistry(self._session)
+        await registry.ensure_seeded(Path(self._settings.capabilities_config))
+        gap = await GapAnalyzer(self._session).analyze(analysis.required_capabilities)
+        gap_ctx: dict[str, object] = {"capability_missing": gap.missing}
 
-        self._set_status(project, ProductState.BACKLOG_GENERATING)
+        if gap.has_gap:
+            missing_text = ", ".join(gap.missing)
+            await self._fire(
+                project, "GAP_FOUND", context=gap_ctx,
+                reason=(
+                    f"이 프로젝트에는 시스템에 아직 없는 기능이 필요합니다: {missing_text}\n"
+                    "필요한 확장 제안(신규 Agent/MCP 연결) 기능은 아직 준비 중입니다"
+                    "(세션 4에서 추가 예정). 해당 기능을 제외하도록 기획을 수정하거나, "
+                    "준비가 끝난 뒤 다시 시도해 주세요."
+                ),
+                actor_id=actor_id,
+            )
+            return
+
+        await self._fire(project, "NO_GAP_FOUND", context=gap_ctx, actor_id=actor_id)
+
         backlog_md = render_backlog_markdown(project.name, spec)
         await self._save_generated_document(
             project, DocumentType.BACKLOG, "BACKLOG.md", backlog_md
         )
-
-        self._set_status(
-            project,
-            ProductState.READY_FOR_DEVELOPMENT,
-            "요구사항이 승인되어 개발 준비가 끝났습니다. PRD와 Backlog를 확인할 수 있습니다.",
+        # Repository 부트스트랩(신규 Repo, BACKLOG_READY_NEW_REPO → BOOTSTRAPPING)은
+        # Phase 8(세션 5) 범위 — 현재는 기존 Repo 경로만 사용한다.
+        await self._fire(
+            project, "BACKLOG_READY_EXISTING",
+            reason=(
+                "요구사항이 승인되어 개발 준비가 끝났습니다. "
+                "PRD와 Backlog를 확인할 수 있습니다."
+            ),
+            actor_id=actor_id,
         )
 
     # ── 내부 유틸 ───────────────────────────────────────────────────
 
-    def _set_status(
-        self, project: Project, new_status: ProductState, reason: str | None = None
+    async def _fire(
+        self,
+        project: Project,
+        event: str,
+        *,
+        reason: str | None = None,
+        context: dict[str, object] | None = None,
+        actor_id: uuid.UUID | None = None,
     ) -> None:
-        current = ProductState(project.status)
-        if (current, new_status) not in _LEGAL_TRANSITIONS:
-            raise IllegalTransitionError(f"불법 상태 전이: {current} → {new_status}")
-        logger.info(
-            "product_state_changed",
-            project_id=str(project.id),
-            from_state=str(current),
-            to_state=str(new_status),
+        await self._machine.fire(
+            project,
+            event,
+            reason=reason,
+            context=context,
+            actor_type="user" if actor_id else "system",
+            actor_id=actor_id,
         )
-        project.status = new_status
-        project.status_reason = reason
 
     async def _collect_input(self, project: Project) -> ProjectInput:
         stmt = (
@@ -456,7 +493,7 @@ class ProductDefinitionWorkflow:
         stmt = (
             select(ProjectClassification)
             .where(ProjectClassification.project_id == project_id)
-            .order_by(ProjectClassification.created_at.desc())
+            .order_by(ProjectClassification.created_at.desc(), ProjectClassification.id.desc())
             .limit(1)
         )
         return (await self._session.execute(stmt)).scalar_one_or_none()
@@ -476,13 +513,3 @@ class ProductDefinitionWorkflow:
         self._session.add(document)
         await self._session.flush()
         return document
-
-
-def _to_draft(requirement: ProjectRequirement) -> RequirementDraft:
-    return RequirementDraft(
-        key=requirement.req_key,
-        description=requirement.description,
-        status=RequirementStatus(requirement.status),
-        category=RequirementCategory(requirement.category),
-        priority=requirement.priority,
-    )

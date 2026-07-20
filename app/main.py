@@ -3,6 +3,7 @@
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
 
@@ -12,6 +13,7 @@ from app.api.documents import router as documents_router
 from app.api.health import router as health_router
 from app.api.projects import router as projects_router
 from app.api.requirements import router as requirements_router
+from app.capabilities.registry import CapabilityRegistry
 from app.core.bootstrap import seed_admin_user
 from app.core.config import Settings, get_settings
 from app.db.session import create_engine_and_factory
@@ -29,6 +31,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.engine = engine
         app.state.session_factory = factory
         await seed_admin_user(factory, app_settings)
+        async with factory() as session:
+            await CapabilityRegistry(session).sync_from_config(
+                Path(app_settings.capabilities_config)
+            )
+            await session.commit()
         logger.info("app_started", env=app_settings.env)
         yield
         await engine.dispose()
