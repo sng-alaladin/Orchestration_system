@@ -1,0 +1,7 @@
+# MCP Allowlist — 연결이 허용된 MCP Server의 curated 목록 (spec 04 §17.1 C)
+# 이 목록에 없는 외부 MCP는 사용자 승인만으로 연결할 수 없다
+# (전문가 확인 필요 또는 자동 차단으로 판정된다).
+
+allowed_servers:
+  - internal-docs-mcp
+  - jira-mcp

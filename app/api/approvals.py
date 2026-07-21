@@ -49,6 +49,8 @@ async def decide(
             await workflow.decide_requirements(project, user, payload.decision, payload.comment)
         elif payload.approval_type == ApprovalType.REDUCED_SCOPE:
             await workflow.decide_reduced_scope(project, user, payload.decision, payload.comment)
+        elif payload.approval_type == ApprovalType.EXPANSION:
+            await workflow.decide_expansion(project, user, payload.decision, payload.comment)
         else:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,

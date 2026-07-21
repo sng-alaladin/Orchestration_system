@@ -1,6 +1,6 @@
 # 구현 진행 상황
 
-마지막 갱신: 2026-07-20 (세션 3 종료)
+마지막 갱신: 2026-07-21 (세션 4 종료)
 
 ## 완료된 Phase
 
@@ -80,33 +80,97 @@
   (EXPANSION_PROPOSING)/정상 흐름(READY_FOR_DEVELOPMENT) 3경로 확인.
 - `uv run pytest`: **198 passed** / ruff 0건 / mypy strict 0건.
 
+### Phase 6 — Agent Factory (세션 4, 완료)
+
+- `app/agents/`: schemas(AgentDefinition, spec 04 §15.3), validators(정의/권한/모델/MCP의존성/
+  Token Budget/Sandbox 검증 체인 §16), registry(AgentDefinitionRecord — Core Agent 직접 쓰기 금지,
+  Factory만 등록, project_scoped 만료), factory(assess: 검증→Policy 판정, register).
+- 하드 불변 차단: 관리자 권한(perm.admin)·Secret 접근(perm.secret) 정의는 검증 단계에서 거부
+  (Policy 이전). 미검증 권한 값/미등록 MCP 의존성/Token Budget 초과/미지원 모델도 거부.
+- 프로젝트 범위·Secret 없음 Agent → 자동 승인, 네트워크/shell 확장·조직 공통 → 전문가 확인.
+
+### Phase 7 — MCP Registry + Policy Engine + 자문 (세션 4, 완료)
+
+- `app/mcp/`: schemas, registry(configs/mcp-servers.yaml → DB 멱등 동기화, tools eager-load),
+  allowlist(configs/mcp-allowlist.yaml), health(Mock — 외부 네트워크/차단 상태 거부),
+  connection(사용 유형 A/B/C/D 분류 §17.1 + Policy 입력 Proposal 생성).
+- `app/policy/`: **결정론적 Policy Engine 4단 판정**(engine.py) — 차단>전문가>사용자>자동 순
+  규칙 사다리, 첫 매칭 승, 미인식은 안전하게 사용자 승인으로 강등(조용한 자동 승인 금지).
+  판정→상태 이벤트 매핑(PRODUCT_EXPANSION_EVENT / DEV_PLAN_EVENT). 최종 판정자는 LLM이 아닌 코드.
+- `app/consultation/`: masking(Secret·개인정보 마스킹 — 키/값/PII 패턴, 과다 마스킹 허용),
+  package(2계층 패키지 빌더 §19.5 — 전 필드 마스킹), service(영속화·답변 기록,
+  원문 미저장·마스킹본만 저장).
+- `app/expansion/`: planner(expansion-catalog.yaml로 부족 역량→Proposal),
+  service(plan_and_judge: 계획→판정→expansion_proposals 감사기록, activate/approve_pending:
+  자동·승인 확장을 MCP 승격+Capability Provider 등록으로 실제 활성화, build_expert_questions).
+- workflow 통합: GAP_FOUND → `_resolve_expansion` → 4단 라우팅(자동=활성화+Backlog /
+  사용자=WAITING_EXPANSION_APPROVAL / 전문가=상담 패키지+대기 / 차단=사유·대안).
+  적합도 게이트 전문가 확인도 상담 패키지 생성. `decide_expansion`(EXPANSION 승인),
+  `apply_consultation_answer`(UNBLOCK/ADJUST_SCOPE/STOP) 추가. **세션 3 스텁 제거**
+  (EXPERT_CONSULTATION_NOT_READY 상수/501 삭제).
+- API: `GET/POST /consultation`, `POST /consultation/answers`, 승인에 EXPANSION 추가.
+- 마이그레이션 0004 (agent_definitions, mcp_servers, mcp_tools, expansion_proposals,
+  expert_consultations). 기동 lifespan에서 MCP Registry도 동기화.
+
+### 세션 4 추가 지시 이행
+
+1. **새로 해소한 deferred Guard**: `deferred:policy-engine@phase7` **5건 전부 해소**
+   (Product EXPANSION_PROPOSING 4 + Development SUPERVISING PLAN_AUTO_APPROVED 1)
+   → 실제 `policy_decision_{auto_approve,user_approval,expert_required,auto_blocked}` Guard로 교체.
+   이 Guard는 ctx["policy_decision"](결정론적 Policy Engine이 계산)이 전환을 인가하는지 검증한다.
+   **남은 deferred Guard(해소 phase)**: phase8(bootstrap·worktree·scope-guard·rebase·cleanup=7),
+   phase9(json-correction·budget-manager·core-output-schema·retry-policy=11),
+   phase10(repair-limit·task-schema·dependency-check·context-package·replan-limit·review-schema·
+   memory-update=12), phase11(git-push·pr-idempotency·webhook-idempotency=3), phase12(quality-gate=1),
+   phase13(artifact-store·packaging=2), phase14(ticket-lock=1). (`grep "deferred:" transitions.py`)
+2. **Secret 마스킹은 테스트로 증명**: `tests/unit/test_secret_masking.py` — password/API key/AWS key/
+   JWT/Bearer/이메일/전화/주민번호/카드/DB URL 비밀번호를 실제로 심어 상담 패키지를 생성하고,
+   패키지 본문·질문·요약 어디에도 원본 값이 남지 않음을 검증(마스킹 감지 요약도 비어있지 않음).
+
+### 세션 4 종료 조건 검증 (2026-07-21)
+
+- 확장 Proposal → 판정 → 등록/차단/자문 **네 경로 모두 통과** (`test_expansion_flow.py`):
+  자동 승인(internal-doc-read→활성화로 Gap 해소) / 사용자 승인(ticket-management→approve_pending 등록) /
+  전문가 확인(email-send→상담 패키지→UNBLOCK 답변→활성화·READY_FOR_DEVELOPMENT) /
+  자동 차단(settlement-read→대안 제시). 판정→상태 머신 목적지도 4경로 모두 검증.
+- Policy Engine 4단 단위 테스트(`test_policy_engine.py`, 규칙 우선순위 포함),
+  Agent Factory 검증·판정·등록(`test_agent_factory.py`), MCP Registry/Allowlist/유형/Health
+  (`test_mcp_registry.py`), Secret 마스킹(`test_secret_masking.py`).
+- `uv run pytest`: **241 passed** / ruff 0건 / mypy strict 0건.
+- Docker(PostgreSQL): 마이그레이션 0004 적용(5개 테이블) + 4경로 판정 + 상담 마스킹 스모크 통과.
+
 ## 진행 중인 Phase
 
-없음. (Phase 6 이후 미착수 — 세션 범위 준수)
+없음. (Phase 8 이후 미착수 — 세션 범위 준수)
 
-## 다음 세션 시작 지점 (세션 4)
+## 다음 세션 시작 지점 (세션 5)
 
-- 범위: Phase 6 (Agent Factory) + Phase 7 (MCP Registry, Allowlist, Policy Engine 4단 판정,
-  전문가 상담 패키지 서비스).
-- 필독 spec: `docs/spec/04, 05, 10`.
-- 종료 조건: 확장 Proposal → 판정 → 등록/차단/자문 흐름 테스트 통과
-  (차단 케이스 + 상담 패키지 생성·답변 반영 케이스 포함).
+- 범위: Phase 8 (Git Workspace + 부트스트랩 + CI 생성) + Phase 9 (Model Adapter, JSON 추출·보정).
+- 필독 spec: `docs/spec/08, 09, 10`.
+- 종료 조건: 임시 Repo 부트스트랩 통과, MockAdapter 왕복 테스트 통과.
 - 참고:
-  - EXPANSION_PROPOSING 진입/이탈 전환은 이미 상태 머신에 존재(Guard는 `deferred:policy-engine@phase7`
-    — 세션 4에서 실제 Policy Engine Guard로 교체할 것).
-  - 상담 패키지 서비스 구현 시: `POST /api/projects/{id}/consultation`의 501 스텁을 대체하고,
-    답변 반영 → `EXPERT_ANSWER_UNBLOCKS`(Guard: expert_confirmed_with_checkpoint —
-    project_classification.expert_confirmed=true 설정 + 체크포인트 복귀)로 게이트 해제.
-    workflow의 `EXPERT_CONSULTATION_NOT_READY` 상수/안내문 제거.
-  - Capability Gap → 확장 Proposal 생성 연결 지점: `workflow._generate_specification`의
-    GAP_FOUND 분기 (현재 명시적 미구현 안내만 남김).
-  - 상담 패키지의 Secret 마스킹 검증 테스트 필수 (spec 10 §40).
+  - Phase 8/9에서 `deferred:*@phase8`(bootstrap·worktree·scope-guard·rebase·cleanup),
+    `deferred:*@phase9`(json-correction·budget-manager·core-output-schema·retry-policy) Guard를
+    실제 검증으로 교체한다.
+  - `agent_mode="live"`는 아직 명시적 오류 — Phase 9에서 Model Adapter 뒤로 연결.
+  - Development 워크플로(Supervisor/Coder/Reviewer)는 Phase 10(세션 6). 현재 Development 머신의
+    SUPERVISING PLAN_AUTO_APPROVED Guard는 Policy Engine 기반으로 이미 실제화됨(ctx로 판정 전달) —
+    세션 6에서 실행 계획 판정을 ctx["policy_decision"]로 넣어 발화할 것.
+  - 확장 UNBLOCK 시 대기(PENDING) Proposal 활성화는 `ExpansionService.approve_pending`가 담당.
 
 ## 알려진 이슈 / 임시 처리
 
 - compose db는 호스트 15432로 노출(`POSTGRES_HOST_PORT`).
-- `deferred:*` Guard 15종은 통과+로그만 한다 — 각 표기된 Phase에서 실제 검증으로 교체 필요
-  (`transitions.py`에서 grep "deferred:" 로 전체 확인 가능).
+- alembic.ini에 한국어 주석이 있어 Windows 호스트에서 `alembic` CLI 직접 실행 시
+  cp949 디코드 오류가 난다. 컨테이너 내부(UTF-8) 또는 ini를 읽지 않는 Python API
+  (`Config(); set_main_option("script_location","migrations"); command.upgrade`)로 실행하면 정상.
+- 감사 로그 정렬: `audit_logs`는 `(occurred_at, id)` 순. Windows에서 `datetime.now()` 해상도가
+  거칠어 같은 tick의 두 레코드는 상대순서가 비결정적일 수 있다(모든 레코드는 정상 기록됨).
+  순서 의존 테스트는 다중집합으로 검증한다.
+- `deferred:*` Guard(현재 phase8~14) 는 통과+로그만 한다 — 각 표기된 Phase에서 실제 검증으로 교체 필요
+  (`transitions.py`에서 grep "deferred:" 로 전체 확인 가능). policy-engine@phase7은 세션 4에서 해소됨.
+- 확장 카탈로그(expansion-catalog.yaml)에 없는 역량은 "해결 방법 미정의" → 전문가 확인으로 안전 강등.
+  AGENT 전략 해결은 카탈로그에 자리만 있고 현재 전문가 강등(프로젝트 전용 Agent 자동 생성은 후속).
 - Development 머신은 엔진·전환 수준으로만 검증됨(전수 매트릭스). 실제 개발 실행 워크플로는
   Phase 10(세션 6). tasks 테이블은 최소 골격.
 - Timeout 검사기는 수동 호출 서비스 — 주기 실행 Worker(Phase 14)에서 연결.
@@ -117,8 +181,10 @@
 
 ## 테스트 상태
 
-- 최근 실행: 2026-07-20 (세션 3 종료 직전)
-- `uv run pytest`: **198 passed, 0 failed**
-  (unit 55 + integration 143 — 전환 매트릭스 118케이스 포함, SQLite in-memory)
+- 최근 실행: 2026-07-21 (세션 4 종료 직전)
+- `uv run pytest`: **241 passed, 0 failed**
+  (세션 3 대비 +43: policy 4단·규칙 우선순위, Agent Factory 검증/판정, Secret 마스킹(심은 값 미노출),
+  MCP Registry/Allowlist/유형/Health, 확장 4경로·상담 답변 반영. 전환 매트릭스 118케이스 포함, SQLite in-memory)
 - `uv run ruff check .` / `uv run mypy app`(strict): 통과
-- Docker 재빌드 + PostgreSQL 3경로 검증(전문가 501 / Gap / 정상): 통과
+- Docker + PostgreSQL 검증: 마이그레이션 0004 적용(agent_definitions/mcp_servers/mcp_tools/
+  expansion_proposals/expert_consultations) + Policy 4경로 판정 + 상담 마스킹 스모크 통과.

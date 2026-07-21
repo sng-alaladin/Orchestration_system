@@ -17,6 +17,7 @@ from app.capabilities.registry import CapabilityRegistry
 from app.core.bootstrap import seed_admin_user
 from app.core.config import Settings, get_settings
 from app.db.session import create_engine_and_factory
+from app.mcp.registry import McpRegistry
 from app.observability.logging import configure_logging, get_logger
 
 
@@ -34,6 +35,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with factory() as session:
             await CapabilityRegistry(session).sync_from_config(
                 Path(app_settings.capabilities_config)
+            )
+            await McpRegistry(session).sync_from_config(
+                Path(app_settings.mcp_servers_config)
             )
             await session.commit()
         logger.info("app_started", env=app_settings.env)

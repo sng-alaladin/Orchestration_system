@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     capabilities_config: str = "configs/capabilities.yaml"
     # 대기 상태 타임아웃 정의 파일
     state_timeouts_config: str = "configs/state-timeouts.yaml"
+    # MCP Registry / Allowlist / 확장 해결 카탈로그 (Phase 7)
+    mcp_servers_config: str = "configs/mcp-servers.yaml"
+    mcp_allowlist_config: str = "configs/mcp-allowlist.yaml"
+    expansion_catalog_config: str = "configs/expansion-catalog.yaml"
 
     session_cookie_name: str = "orch_session"
     session_ttl_hours: int = 168  # 7일

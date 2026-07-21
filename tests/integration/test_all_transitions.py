@@ -174,6 +174,14 @@ async def _prepare_guard(
             ctx["capability_missing"] = []
         case "capability_gap_exists":
             ctx["capability_missing"] = ["email-send"]
+        case "policy_decision_auto_approve":
+            ctx["policy_decision"] = "AUTO_APPROVE"
+        case "policy_decision_user_approval":
+            ctx["policy_decision"] = "USER_APPROVAL"
+        case "policy_decision_expert_required":
+            ctx["policy_decision"] = "EXPERT_REQUIRED"
+        case "policy_decision_auto_blocked":
+            ctx["policy_decision"] = "AUTO_BLOCKED"
         case "checkpoint_exists" | "can_retry":
             needs_checkpoint = True
         case _:

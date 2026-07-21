@@ -1,0 +1,26 @@
+# 확장 해결 카탈로그 — 부족한 Capability를 어떤 자원으로 채울지 정의 (spec 04 §15.1)
+# GapAnalyzer가 찾은 missing capability를 이 카탈로그로 해결 Proposal로 변환한다.
+# 카탈로그에 없는 capability는 "해결 방법 미정의" → 전문가 확인 필요로 판정된다.
+#
+# strategy: MCP_CONNECTION (mcp_server 필요) | AGENT (프로젝트 전용 Agent 생성)
+
+resolutions:
+  email-send:
+    strategy: MCP_CONNECTION
+    mcp_server: gmail-mcp
+    write: true
+
+  ticket-management:
+    strategy: MCP_CONNECTION
+    mcp_server: jira-mcp
+    write: true
+
+  internal-doc-read:
+    strategy: MCP_CONNECTION
+    mcp_server: internal-docs-mcp
+    write: false
+
+  settlement-read:
+    strategy: MCP_CONNECTION
+    mcp_server: internal-settlement-mcp
+    write: false

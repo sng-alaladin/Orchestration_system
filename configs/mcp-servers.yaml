@@ -1,0 +1,53 @@
+# MCP Server Registry 초기 정의 (spec 04 §17)
+# 기동 시 DB(mcp_servers/mcp_tools)로 멱등 동기화된다.
+#
+# status: APPROVED(등록·검증 완료, 활성화 가능) | PROPOSED(연결 제안 — 판정/승인 필요)
+#         | BLOCKED | DISABLED
+# 위험도·데이터 등급·allowlist 여부가 Policy Engine 4단 판정을 좌우한다.
+
+servers:
+  internal-docs-mcp:
+    name: 사내 문서 읽기 MCP
+    status: APPROVED
+    risk_level: LOW
+    data_classification: INTERNAL
+    external_network: false
+    read_permissions: [docs:read]
+    tools:
+      - {name: read_doc, write: false}
+      - {name: search_docs, write: false}
+
+  jira-mcp:
+    name: Jira MCP
+    status: APPROVED
+    risk_level: MEDIUM
+    data_classification: INTERNAL
+    external_network: false
+    read_permissions: [jira:issue]
+    write_permissions: [jira:comment, jira:transition]
+    tools:
+      - {name: read_issue, write: false}
+      - {name: create_issue, write: true, requires_user_approval: true}
+      - {name: transition_issue, write: true, requires_user_approval: true}
+
+  # 신규 외부 연결 제안 — allowlist에 없음 → 전문가 확인 필요
+  gmail-mcp:
+    name: Gmail MCP (이메일 발송)
+    status: PROPOSED
+    risk_level: MEDIUM
+    data_classification: INTERNAL
+    external_network: false
+    write_permissions: [gmail:send]
+    tools:
+      - {name: send_email, write: true, requires_user_approval: true}
+
+  # 기밀 데이터 접근 — allowlist에 없고 위험도 높음 → 자동 차단
+  internal-settlement-mcp:
+    name: 사내 정산 시스템 MCP
+    status: PROPOSED
+    risk_level: HIGH
+    data_classification: CONFIDENTIAL
+    external_network: false
+    read_permissions: [settlement:read]
+    tools:
+      - {name: read_settlement, write: false}

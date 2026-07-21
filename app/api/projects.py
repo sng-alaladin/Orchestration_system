@@ -9,19 +9,17 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_owned_project
+from app.consultation.service import ConsultationService
 from app.core.auth import get_app_settings, get_current_user
 from app.core.config import Settings
 from app.core.enums import ProductState
+from app.db.models.expert_consultation import ExpertConsultation
 from app.db.models.project import Project
 from app.db.models.project_classification import ProjectClassification
 from app.db.models.user import User
 from app.db.session import get_db
 from app.orchestrator.state_machine import StateMachineError
-from app.product.workflow import (
-    EXPERT_CONSULTATION_NOT_READY,
-    WorkflowStateError,
-    build_workflow,
-)
+from app.product.workflow import WorkflowStateError, build_workflow
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -154,12 +152,79 @@ async def analyze_project(
     return ProjectResponse.from_model(project)
 
 
-@router.post("/{project_id}/consultation")
-async def request_consultation(
-    project: Annotated[Project, Depends(get_owned_project)],
-) -> None:
-    """전문가 상담 패키지 생성 — Phase 7(세션 4)에서 구현 예정.
+class ConsultationResponse(BaseModel):
+    id: uuid.UUID
+    status: str
+    trigger: str
+    title: str
+    markdown: str
+    questions: list[dict[str, object]]
+    answers: list[dict[str, object]]
+    masking_summary: dict[str, int]
 
-    조용히 실패하지 않도록 명시적 501(Not Implemented)을 반환한다.
-    """
-    raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, EXPERT_CONSULTATION_NOT_READY)
+    @classmethod
+    def from_model(cls, c: "ExpertConsultation") -> "ConsultationResponse":
+        return cls(
+            id=c.id,
+            status=c.status,
+            trigger=c.trigger,
+            title=c.title,
+            markdown=c.package_markdown,
+            questions=list(c.questions),
+            answers=list(c.answers),
+            masking_summary=dict(c.masking_summary),
+        )
+
+
+class ConsultationAnswerRequest(BaseModel):
+    question_key: str = Field(min_length=1)
+    answer: str = Field(min_length=1)
+    resolution: str = Field(description="UNBLOCK | ADJUST_SCOPE | STOP")
+
+
+@router.get("/{project_id}/consultation")
+async def get_consultation(
+    project: Annotated[Project, Depends(get_owned_project)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ConsultationResponse:
+    """전문가 상담 패키지 조회 (다운로드/복사용). Secret은 이미 마스킹되어 저장된다."""
+    consultation = await ConsultationService(db).latest_for_project(project.id)
+    if consultation is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "생성된 상담 패키지가 없습니다."
+        )
+    return ConsultationResponse.from_model(consultation)
+
+
+@router.post("/{project_id}/consultation", status_code=201)
+async def create_consultation(
+    project: Annotated[Project, Depends(get_owned_project)],
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> ConsultationResponse:
+    """사용자가 직접 '개발자에게 물어볼 자료 만들기'를 요청 (spec 05 §19.5 수동 트리거)."""
+    workflow = build_workflow(db, settings)
+    consultation = await workflow.create_manual_consultation(project, user)
+    await db.commit()
+    return ConsultationResponse.from_model(consultation)
+
+
+@router.post("/{project_id}/consultation/answers")
+async def answer_consultation(
+    payload: ConsultationAnswerRequest,
+    project: Annotated[Project, Depends(get_owned_project)],
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> ProjectResponse:
+    """개발자 답변 입력 → 게이트 해제/범위 조정/중단 반영 (spec 05 §19.3)."""
+    workflow = build_workflow(db, settings)
+    try:
+        await workflow.apply_consultation_answer(
+            project, user, payload.question_key, payload.answer, payload.resolution
+        )
+    except (WorkflowStateError, StateMachineError) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    await db.commit()
+    return ProjectResponse.from_model(project)

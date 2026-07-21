@@ -100,10 +100,11 @@ async def test_idempotency_key_prevents_double_apply(
         assert project.status == ProductState.DOCUMENT_ANALYZING
 
         rows = await _audit_rows(session, project.id)
-        assert [r.event_type for r in rows] == [
-            AuditEventType.STATE_TRANSITION,
-            AuditEventType.IDEMPOTENT_REPLAY,
-        ]
+        # 정확히 전환 1건 + 멱등 재생 1건이 기록된다.
+        # (occurred_at 동률 시 상대순서는 보장되지 않으므로 다중집합으로 검증)
+        assert sorted(r.event_type for r in rows) == sorted(
+            [AuditEventType.STATE_TRANSITION, AuditEventType.IDEMPOTENT_REPLAY]
+        )
 
 
 async def test_checkpoint_saved_on_exception_and_resumed(

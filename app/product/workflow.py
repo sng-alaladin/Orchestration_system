@@ -14,27 +14,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.capabilities.gap_analyzer import GapAnalyzer
 from app.capabilities.registry import CapabilityRegistry
+from app.consultation.package import ConsultationContext, ConsultationOption, ConsultationQuestion
+from app.consultation.service import ConsultationService
 from app.core.clock import utc_now
 from app.core.config import Settings
 from app.core.enums import (
     ApprovalDecision,
     ApprovalType,
     ClassificationGate,
+    ConsultationTrigger,
     DecisionSource,
     DocumentKind,
     DocumentType,
+    PolicyDecision,
     ProductState,
     QuestionStatus,
     RequirementCategory,
     RequirementStatus,
 )
 from app.core.exceptions import AppError
+from app.db.models.expert_consultation import ExpertConsultation
 from app.db.models.project import Project
 from app.db.models.project_classification import ProjectClassification
 from app.db.models.project_document import ProjectDocument
 from app.db.models.requirement_question import RequirementQuestion
 from app.db.models.user import User
 from app.db.models.user_approval import UserApproval
+from app.expansion.service import ExpansionResolution, build_expansion_service
 from app.observability.logging import get_logger
 from app.orchestrator.product_state_machine import build_product_state_machine
 from app.orchestrator.state_machine import StateMachine
@@ -43,20 +49,24 @@ from app.product.classifier import Classifier
 from app.product.core_agent import CoreAgent, MockCoreAgent
 from app.product.question_generator import build_question_cards
 from app.product.requirement_agent import MockRequirementAgent, RequirementAgent
-from app.product.schemas import CoreAnalysis, ProjectInput, RequirementDraft, RequirementSet
+from app.product.schemas import (
+    CoreAnalysis,
+    ProjectInput,
+    RequirementDraft,
+    RequirementSet,
+    SpecificationResult,
+)
 from app.product.specification_agent import MockSpecificationAgent, SpecificationAgent
 from app.project_memory.conflict_detector import DecisionConflict
 from app.project_memory.service import ProjectMemoryService
 
 logger = get_logger(__name__)
 
-# 전문가 상담 패키지 서비스(Phase 7, 세션 4) 구현 전의 명시적 안내문.
-# 조용히 멈추지 않는다 — 사용자에게 무엇이 안 되고 무엇을 할 수 있는지 알린다.
-EXPERT_CONSULTATION_NOT_READY = (
-    "전문가 상담 패키지 자동 생성 기능은 아직 준비 중입니다(세션 4에서 추가 예정). "
-    "지금은 위 사유를 개발자에게 직접 전달해 확인을 받아 주세요. "
-    "확인이 끝나면 시스템 운영자가 진행을 재개할 수 있습니다."
-)
+# 전문가 자문 답변의 처리 방향 (spec 05 §19.3)
+ANSWER_UNBLOCK = "UNBLOCK"  # 게이트 해제 후 진행
+ANSWER_ADJUST_SCOPE = "ADJUST_SCOPE"  # 범위 조정 후 재계획
+ANSWER_STOP = "STOP"  # 중단
+ANSWER_RESOLUTIONS = frozenset({ANSWER_UNBLOCK, ANSWER_ADJUST_SCOPE, ANSWER_STOP})
 
 
 class WorkflowStateError(AppError):
@@ -97,6 +107,8 @@ class ProductDefinitionWorkflow:
         self._requirement = requirement_agent
         self._specification = specification_agent
         self._memory = ProjectMemoryService(session)
+        self._consultation = ConsultationService(session)
+        self._expansion = build_expansion_service(session, settings)
         self._machine: StateMachine = build_product_state_machine(
             session, max_retries=settings.max_retry_attempts
         )
@@ -154,9 +166,14 @@ class ProductDefinitionWorkflow:
                     await self._fire(project, "EXPERT_CONFIRMED_PROCEED", actor_id=actor_id)
                     await self._draft_requirements(project, analysis, actor_id)
                 else:
+                    await self._create_gate_consultation(project, analysis, classification)
                     await self._fire(
                         project, "CLASSIFIED_EXPERT_REVIEW",
-                        reason=f"{classification.user_message}\n{EXPERT_CONSULTATION_NOT_READY}",
+                        reason=(
+                            f"{classification.user_message}\n"
+                            "개발자에게 전달할 상담 자료를 생성했습니다. 자문 화면에서 "
+                            "다운로드/복사해 전달하고, 답변을 입력하면 진행을 재개합니다."
+                        ),
                         actor_id=actor_id,
                     )
             case ClassificationGate.NEEDS_APPROVAL:
@@ -321,11 +338,125 @@ class ProductDefinitionWorkflow:
             )
         return project
 
+    async def decide_expansion(
+        self,
+        project: Project,
+        user: User,
+        decision: ApprovalDecision,
+        comment: str | None,
+    ) -> Project:
+        """확장 Proposal 사용자 승인 (WAITING_EXPANSION_APPROVAL)."""
+        if project.status != ProductState.WAITING_EXPANSION_APPROVAL:
+            raise WorkflowStateError("지금은 확장 승인 단계가 아닙니다.")
+        self._session.add(
+            UserApproval(
+                project_id=project.id,
+                user_id=user.id,
+                approval_type=ApprovalType.EXPANSION,
+                target_ref="expansion",
+                decision=decision,
+                comment=comment,
+            )
+        )
+        await self._session.flush()
+
+        if decision == ApprovalDecision.APPROVED:
+            # 승인된 사용자-승인 확장을 활성화한 뒤 Backlog 생성으로 진행
+            await self._activate_pending_expansions(project)
+            await self._fire(project, "EXPANSION_APPROVED", actor_id=user.id)
+            spec = await self._rebuild_spec(project)
+            await self._generate_backlog(project, spec, user.id)
+        else:
+            await self._fire(
+                project, "EXPANSION_DENIED",
+                reason=(
+                    "확장 제안이 거절되었습니다. 기존 기능만으로 범위를 줄여 다시 진행하거나 "
+                    "중단할 수 있습니다."
+                ),
+                actor_id=user.id,
+            )
+        return project
+
+    # ── 자문 답변 반영 (전문가 확인 게이트 해제/조정/중단) ──────────
+
+    async def apply_consultation_answer(
+        self,
+        project: Project,
+        user: User,
+        question_key: str,
+        answer: str,
+        resolution: str,
+    ) -> Project:
+        if project.status != ProductState.WAITING_EXPERT_CONFIRMATION:
+            raise WorkflowStateError("지금은 전문가 자문 답변을 반영하는 단계가 아닙니다.")
+        if resolution not in ANSWER_RESOLUTIONS:
+            raise WorkflowStateError(
+                "답변 방향은 진행(UNBLOCK)/범위조정(ADJUST_SCOPE)/중단(STOP) 중 하나여야 합니다."
+            )
+        consultation = await self._consultation.latest_for_project(project.id)
+        if consultation is None:
+            raise WorkflowStateError("연결된 상담 패키지를 찾을 수 없습니다.")
+        action_text = {
+            ANSWER_UNBLOCK: "게이트 해제 후 진행",
+            ANSWER_ADJUST_SCOPE: "범위 조정 후 재작성",
+            ANSWER_STOP: "중단",
+        }[resolution]
+        await self._consultation.record_answer(
+            consultation, question_key=question_key, answer=answer,
+            action=action_text, actor_id=user.id,
+        )
+
+        if resolution == ANSWER_STOP:
+            await self._fire(
+                project, "EXPERT_ANSWER_STOPS",
+                reason="개발자 자문 결과에 따라 프로젝트를 중단했습니다.", actor_id=user.id,
+            )
+        elif resolution == ANSWER_ADJUST_SCOPE:
+            await self._fire(
+                project, "EXPERT_ANSWER_ADJUSTS_SCOPE",
+                reason="개발자 자문 결과에 따라 범위를 조정해 요구사항을 다시 정리합니다.",
+                actor_id=user.id,
+            )
+            await self.redraft(project, actor_id=user.id)
+        else:  # UNBLOCK
+            await self._unblock_after_expert(project, consultation, user)
+        await self._consultation.mark_applied(consultation)
+        return project
+
+    async def _unblock_after_expert(
+        self, project: Project, consultation: ExpertConsultation, user: User
+    ) -> None:
+        """전문가 확인 완료 → 체크포인트 복귀 후 진행 (spec 05 §19.3)."""
+        # expert_confirmed 플래그 설정 (게이트 재진입 방지 + Guard 통과 근거)
+        classification = await self._latest_classification(project.id)
+        if classification is not None:
+            classification.expert_confirmed = True
+            await self._session.flush()
+
+        await self._fire(
+            project, "EXPERT_ANSWER_UNBLOCKS",
+            reason="개발자 확인이 완료되어 진행을 재개합니다.", actor_id=user.id,
+        )
+        # 체크포인트 복귀 지점에 따라 이어서 진행
+        if project.status == ProductState.CLASSIFYING:
+            await self._fire(project, "EXPERT_CONFIRMED_PROCEED", actor_id=user.id)
+            await self.redraft(project, actor_id=user.id)
+        elif project.status == ProductState.EXPANSION_PROPOSING:
+            # 전문가가 확장 연결을 승인 → 대기 중이던 확장을 활성화하고 진행
+            await self._activate_pending_expansions(project)
+            await self._fire(
+                project, "PROPOSAL_AUTO_APPROVED",
+                context={"policy_decision": PolicyDecision.AUTO_APPROVE.value},
+                reason="개발자 확인이 완료되어 확장을 반영하고 개발 준비를 진행합니다.",
+                actor_id=user.id,
+            )
+            spec = await self._rebuild_spec(project)
+            await self._generate_backlog(project, spec, user.id)
+
     # ── 5) 명세(PRD) + Capability Gap + Backlog ────────────────────
 
-    async def _generate_specification(
-        self, project: Project, actor_id: uuid.UUID | None
-    ) -> None:
+    async def _build_spec(self, project: Project) -> SpecificationResult:
+        """활성 요구사항·결정으로 명세(PRD 등)를 생성한다 (부작용 없음)."""
         project_input = await self._collect_input(project)
         analysis = await self._core.analyze(project_input)
         requirements = await self._memory.requirements.list_active(project.id)
@@ -342,13 +473,23 @@ class ProductDefinitionWorkflow:
         decisions = [
             (d.title, d.decision) for d in await self._memory.decisions.list_active(project.id)
         ]
-        spec = await self._specification.generate(
+        return await self._specification.generate(
             project_name=project.name,
             project_goal=analysis.project_goal,
             deliverable_type=analysis.deliverable_type,
             requirements=drafts,
             decisions=decisions,
         )
+
+    async def _rebuild_spec(self, project: Project) -> SpecificationResult:
+        return await self._build_spec(project)
+
+    async def _generate_specification(
+        self, project: Project, actor_id: uuid.UUID | None
+    ) -> None:
+        project_input = await self._collect_input(project)
+        analysis = await self._core.analyze(project_input)
+        spec = await self._build_spec(project)
         await self._save_generated_document(
             project, DocumentType.PRD, "PRD.md", spec.prd_markdown
         )
@@ -361,21 +502,16 @@ class ProductDefinitionWorkflow:
         gap_ctx: dict[str, object] = {"capability_missing": gap.missing}
 
         if gap.has_gap:
-            missing_text = ", ".join(gap.missing)
-            await self._fire(
-                project, "GAP_FOUND", context=gap_ctx,
-                reason=(
-                    f"이 프로젝트에는 시스템에 아직 없는 기능이 필요합니다: {missing_text}\n"
-                    "필요한 확장 제안(신규 Agent/MCP 연결) 기능은 아직 준비 중입니다"
-                    "(세션 4에서 추가 예정). 해당 기능을 제외하도록 기획을 수정하거나, "
-                    "준비가 끝난 뒤 다시 시도해 주세요."
-                ),
-                actor_id=actor_id,
-            )
+            await self._fire(project, "GAP_FOUND", context=gap_ctx, actor_id=actor_id)
+            await self._resolve_expansion(project, spec, gap.missing, actor_id)
             return
 
         await self._fire(project, "NO_GAP_FOUND", context=gap_ctx, actor_id=actor_id)
+        await self._generate_backlog(project, spec, actor_id)
 
+    async def _generate_backlog(
+        self, project: Project, spec: "SpecificationResult", actor_id: uuid.UUID | None
+    ) -> None:
         backlog_md = render_backlog_markdown(project.name, spec)
         await self._save_generated_document(
             project, DocumentType.BACKLOG, "BACKLOG.md", backlog_md
@@ -389,6 +525,160 @@ class ProductDefinitionWorkflow:
                 "PRD와 Backlog를 확인할 수 있습니다."
             ),
             actor_id=actor_id,
+        )
+
+    # ── 6) 확장 Proposal → Policy 판정 → 라우팅 (Phase 7) ───────────
+
+    async def _resolve_expansion(
+        self,
+        project: Project,
+        spec: SpecificationResult,
+        missing: list[str],
+        actor_id: uuid.UUID | None,
+    ) -> None:
+        """EXPANSION_PROPOSING에서 부족 역량을 판정하고 4단 경로로 라우팅한다."""
+        resolution = await self._expansion.plan_and_judge(project.id, missing)
+        ctx: dict[str, object] = {"policy_decision": resolution.decision.value}
+
+        match resolution.decision:
+            case PolicyDecision.AUTO_APPROVE:
+                await self._expansion.activate(resolution)
+                await self._fire(
+                    project, "PROPOSAL_AUTO_APPROVED", context=ctx,
+                    reason=resolution.reason or "필요한 확장을 자동으로 준비했습니다.",
+                    actor_id=actor_id,
+                )
+                await self._generate_backlog(project, spec, actor_id)
+            case PolicyDecision.USER_APPROVAL:
+                await self._fire(
+                    project, "PROPOSAL_NEEDS_USER", context=ctx,
+                    reason=(
+                        f"{resolution.reason}\n"
+                        "승인 화면에서 이 확장을 진행할지 결정해 주세요."
+                    ),
+                    actor_id=actor_id,
+                )
+            case PolicyDecision.EXPERT_REQUIRED:
+                await self._create_expansion_consultation(project, resolution)
+                await self._fire(
+                    project, "PROPOSAL_NEEDS_EXPERT", context=ctx,
+                    reason=resolution.reason,
+                    actor_id=actor_id,
+                )
+            case PolicyDecision.AUTO_BLOCKED:
+                alt_text = (
+                    "\n대안: " + " / ".join(resolution.alternatives)
+                    if resolution.alternatives
+                    else ""
+                )
+                await self._fire(
+                    project, "PROPOSAL_BLOCKED", context=ctx,
+                    reason=f"{resolution.reason}{alt_text}",
+                    actor_id=actor_id,
+                )
+
+    async def _activate_pending_expansions(self, project: Project) -> None:
+        """대기(PENDING_USER/PENDING_EXPERT) 확장 Proposal을 승인·활성화한다 (서비스 위임)."""
+        await self._expansion.approve_pending(project.id)
+
+    # ── 전문가 상담 패키지 생성 ─────────────────────────────────────
+
+    async def create_manual_consultation(
+        self, project: Project, user: User
+    ) -> ExpertConsultation:
+        """사용자가 직접 '개발자에게 물어볼 자료 만들기'를 요청한 경우 (spec 05 §19.5).
+
+        상태를 바꾸지 않는다 — 어떤 단계에서도 자료를 만들 수 있다.
+        """
+        project_input = await self._collect_input(project)
+        analysis = await self._core.analyze(project_input)
+        classification = await self._latest_classification(project.id)
+        context = ConsultationContext(
+            project_name=project.name,
+            situation_summary="사용자가 개발자에게 물어볼 자료를 직접 요청했습니다.",
+            why_expert_needed=(
+                classification.user_message if classification else "사용자 직접 요청"
+            ),
+            key_questions=[
+                ConsultationQuestion(
+                    key="MANUAL",
+                    question="이 프로젝트에 대해 개발자에게 확인하고 싶은 점을 정리했습니다.",
+                    options=[],
+                )
+            ],
+            project_overview=analysis.project_goal,
+            requirements_summary=project.idea_text or "",
+            failure_point=f"현재 상태: {project.status}",
+            environment="Orchestrator (사용자 요청 자문)",
+        )
+        return await self._consultation.create(
+            project_id=project.id,
+            trigger=ConsultationTrigger.USER_REQUESTED,
+            context=context,
+            actor_id=user.id,
+        )
+
+    async def _create_gate_consultation(
+        self,
+        project: Project,
+        analysis: CoreAnalysis,
+        classification: object,
+    ) -> ExpertConsultation:
+        """적합도 게이트 전문가 확인용 상담 패키지 (spec 05 §19.3)."""
+        user_message = getattr(classification, "user_message", "")
+        idea = project.idea_text or ""
+        question = ConsultationQuestion(
+            key="GATE-EXPERT",
+            question="이 프로젝트를 개발자 확인 후 그대로 진행할까요?",
+            options=[
+                ConsultationOption(
+                    label="A. 확인했고 그대로 진행한다",
+                    action="자문 화면에서 A(UNBLOCK) 선택 → 게이트 해제 후 요구사항 정리를 진행",
+                ),
+                ConsultationOption(
+                    label="B. 범위를 조정해 진행한다",
+                    action="자문 화면에서 B(ADJUST_SCOPE) 선택 → 범위를 조정해 요구사항 재작성",
+                ),
+                ConsultationOption(
+                    label="C. 중단한다",
+                    action="자문 화면에서 C(STOP) 선택 → 프로젝트를 중단합니다.",
+                ),
+            ],
+        )
+        context = ConsultationContext(
+            project_name=project.name,
+            situation_summary="이 기획에는 개발자 확인이 필요한 부분이 있어 진행을 멈췄습니다.",
+            why_expert_needed=user_message,
+            key_questions=[question],
+            project_overview=analysis.project_goal,
+            requirements_summary=idea,
+            failure_point="현재 상태: WAITING_EXPERT_CONFIRMATION (적합도 게이트)",
+            environment="Orchestrator Product Definition 단계",
+        )
+        return await self._consultation.create(
+            project_id=project.id,
+            trigger=ConsultationTrigger.EXPERT_REQUIRED,
+            context=context,
+        )
+
+    async def _create_expansion_consultation(
+        self, project: Project, resolution: ExpansionResolution
+    ) -> ExpertConsultation:
+        """확장(신규 연결) 전문가 확인용 상담 패키지 (spec 05 §19.3)."""
+        questions = self._expansion.build_expert_questions(resolution)
+        context = ConsultationContext(
+            project_name=project.name,
+            situation_summary="요청하신 기능에 새 외부 연결이 필요해 개발자 확인이 필요합니다.",
+            why_expert_needed=resolution.reason,
+            key_questions=questions,
+            project_overview=project.idea_text or "",
+            failure_point="현재 상태: EXPANSION_PROPOSING (확장 연결 — 전문가 확인 필요)",
+            environment="Orchestrator Capability 확장 단계",
+        )
+        return await self._consultation.create(
+            project_id=project.id,
+            trigger=ConsultationTrigger.EXPERT_REQUIRED,
+            context=context,
         )
 
     # ── 내부 유틸 ───────────────────────────────────────────────────

@@ -13,7 +13,7 @@ from typing import Any, Protocol
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.enums import ApprovalDecision, ApprovalType, QuestionStatus
+from app.core.enums import ApprovalDecision, ApprovalType, PolicyDecision, QuestionStatus
 from app.db.models.project_classification import ProjectClassification
 from app.db.models.project_document import ProjectDocument
 from app.db.models.requirement_question import RequirementQuestion
@@ -254,6 +254,25 @@ async def expert_confirmed_with_checkpoint(
     return await checkpoint_exists(session, subject, ctx)
 
 
+def _policy_decision_guard(expected: PolicyDecision) -> GuardFn:
+    """Policy Engine(결정론적)이 내린 판정이 이 전환을 인가하는지 검증한다 (spec 04 §16).
+
+    판정 값은 ctx["policy_decision"]로 전달된다. Policy Engine만 이 값을 계산하며,
+    LLM/Agent는 fire()를 호출하지 않는다. 잘못된 이벤트를 쏘면 Guard가 거부(안전 실패).
+    """
+
+    async def guard(session: AsyncSession, subject: Any, ctx: dict[str, Any]) -> GuardResult:
+        decision = ctx.get("policy_decision")
+        if decision == expected:
+            return GuardResult(True)
+        return GuardResult(
+            False,
+            f"Policy Engine 판정({decision})이 이 전환({expected})을 인가하지 않습니다.",
+        )
+
+    return guard
+
+
 async def can_retry(session: AsyncSession, subject: Any, ctx: dict[str, Any]) -> GuardResult:
     cp = await checkpoint_exists(session, subject, ctx)
     if not cp.ok:
@@ -317,6 +336,19 @@ class GuardRegistry:
             "capability_gap_exists": capability_gap_exists,
             "checkpoint_exists": checkpoint_exists,
             "can_retry": can_retry,
+            # Policy Engine 4단 판정 Guard (Phase 7에서 deferred:policy-engine@phase7 대체)
+            "policy_decision_auto_approve": _policy_decision_guard(
+                PolicyDecision.AUTO_APPROVE
+            ),
+            "policy_decision_user_approval": _policy_decision_guard(
+                PolicyDecision.USER_APPROVAL
+            ),
+            "policy_decision_expert_required": _policy_decision_guard(
+                PolicyDecision.EXPERT_REQUIRED
+            ),
+            "policy_decision_auto_blocked": _policy_decision_guard(
+                PolicyDecision.AUTO_BLOCKED
+            ),
         }
 
     def known_names(self) -> set[str]:

@@ -163,3 +163,100 @@ class AuditEventType(StrEnum):
     GUARD_REJECTED = "GUARD_REJECTED"
     IDEMPOTENT_REPLAY = "IDEMPOTENT_REPLAY"
     TIMEOUT_NOTIFIED = "TIMEOUT_NOTIFIED"
+    # Phase 6~7 (확장 구조 / 자문)
+    POLICY_DECISION = "POLICY_DECISION"
+    AGENT_REGISTERED = "AGENT_REGISTERED"
+    AGENT_VALIDATION_REJECTED = "AGENT_VALIDATION_REJECTED"
+    MCP_CONNECTION_PROPOSED = "MCP_CONNECTION_PROPOSED"
+    MCP_ACTIVATED = "MCP_ACTIVATED"
+    CONSULTATION_CREATED = "CONSULTATION_CREATED"
+    EXPERT_ANSWER_RECORDED = "EXPERT_ANSWER_RECORDED"
+
+
+# ── Phase 6~7: 확장 구조 (Agent Factory / MCP Registry / Policy Engine / 자문) ──
+
+
+class PolicyDecision(StrEnum):
+    """Policy Engine 4단 판정 (spec 05 §19)."""
+
+    AUTO_APPROVE = "AUTO_APPROVE"  # 코드로 즉시 승인
+    USER_APPROVAL = "USER_APPROVAL"  # 사용자가 업무·기능·비용 관점에서 판단
+    EXPERT_REQUIRED = "EXPERT_REQUIRED"  # 개발자 자문 필요 → 상담 패키지 생성
+    AUTO_BLOCKED = "AUTO_BLOCKED"  # 정책상 금지, 자문으로도 우회 불가(또는 MVP 차단)
+
+
+class ProposalType(StrEnum):
+    """확장 Proposal 종류 (spec 04 §15~17)."""
+
+    AGENT = "AGENT"  # 신규/임시 Agent 생성
+    MCP_CONNECTION = "MCP_CONNECTION"  # MCP 활성화·연결
+
+
+class RiskLevel(StrEnum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+
+
+class DataClassification(StrEnum):
+    PUBLIC = "PUBLIC"
+    INTERNAL = "INTERNAL"
+    CONFIDENTIAL = "CONFIDENTIAL"
+
+
+class AgentLifecycleType(StrEnum):
+    """Agent 수명 주기 (spec 04 §15.3)."""
+
+    PROJECT_SCOPED = "project_scoped"  # 프로젝트 종료 시 만료
+    TASK_SCOPED = "task_scoped"  # 단일 Task 임시 Agent
+    PERSISTENT = "persistent"  # 조직 공통 (등록은 전문가 확인 필요)
+
+
+class AgentStatus(StrEnum):
+    REGISTERED = "REGISTERED"
+    ACTIVE = "ACTIVE"
+    EXPIRED = "EXPIRED"
+    REVOKED = "REVOKED"
+
+
+class McpStatus(StrEnum):
+    """MCP Server 등록 상태 (spec 04 §17)."""
+
+    APPROVED = "APPROVED"  # 등록·검증 완료 (활성화 가능)
+    PROPOSED = "PROPOSED"  # 연결 제안됨 (판정 전/대기)
+    BLOCKED = "BLOCKED"  # 정책상 차단
+    DISABLED = "DISABLED"  # 비활성
+
+
+class McpUsageType(StrEnum):
+    """MCP 사용 유형 (spec 04 §17.1)."""
+
+    A_READONLY_ACTIVATE = "A"  # 기존 승인 MCP 읽기 전용 자동 활성화
+    B_WRITE_ACTIVATE = "B"  # 기존 MCP 쓰기 기능 활성화 (사용자 승인)
+    C_NEW_EXTERNAL = "C"  # 신규 외부 MCP 연결 (allowlist 한정)
+    D_NEW_SERVER = "D"  # 신규 MCP Server 개발
+
+
+class ConsultationTrigger(StrEnum):
+    """전문가 상담 패키지 생성 시점 (spec 05 §19.5)."""
+
+    EXPERT_REQUIRED = "EXPERT_REQUIRED"  # 전문가 확인 필요 판정
+    RETRY_EXHAUSTED = "RETRY_EXHAUSTED"  # 재시도 한도 초과
+    SYSTEM_ERROR = "SYSTEM_ERROR"  # Orchestrator 자체 오류
+    USER_REQUESTED = "USER_REQUESTED"  # 사용자가 직접 요청
+
+
+class ConsultationStatus(StrEnum):
+    PENDING = "PENDING"  # 답변 대기
+    ANSWERED = "ANSWERED"  # 답변 입력됨
+    APPLIED = "APPLIED"  # 답변 반영 완료 (게이트 해제/조정/중단)
+
+
+class ExpansionStatus(StrEnum):
+    PROPOSED = "PROPOSED"
+    AUTO_APPROVED = "AUTO_APPROVED"
+    PENDING_USER = "PENDING_USER"
+    PENDING_EXPERT = "PENDING_EXPERT"
+    APPROVED = "APPROVED"
+    BLOCKED = "BLOCKED"
+    REJECTED = "REJECTED"
